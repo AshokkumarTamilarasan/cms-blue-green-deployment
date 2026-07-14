@@ -124,7 +124,7 @@ jobs:
             exit 1
           fi
 
-          if ! grep -q "Version 3.0" response.html; then
+          if ! grep -q "Version 999.0" response.html; then
             echo "Expected Version 3.0 not found."
             exit 1
           fi
