@@ -1,4 +1,4 @@
-name: Blue Green Deployment
+name: Blue Green Deployment With Automatic Rollback
 
 on:
   workflow_dispatch:
@@ -6,6 +6,14 @@ on:
 permissions:
   id-token: write
   contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  GREEN_INSTANCE_ID: i-02e6e4c9ede81f5a4
+  BLUE_TG_ARN: arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-BLUE-TG/06abf1f6715cc596
+  GREEN_TG_ARN: arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425
+  LISTENER_ARN: arn:aws:elasticloadbalancing:ap-south-1:466749146115:listener/app/CMS-PROD-ALB/186ae3866b40321d/94172dd3b6a19e17
+  ALB_ARN: arn:aws:elasticloadbalancing:ap-south-1:466749146115:loadbalancer/app/CMS-PROD-ALB/186ae3866b40321d
 
 jobs:
   deploy-to-green:
@@ -19,12 +27,12 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::466749146115:role/GitHubActions-BlueGreen-Role
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy Version 3.0 to Green using SSM
+      - name: Deploy Version 3.0 to Green
         run: |
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "i-02e6e4c9ede81f5a4" \
+            --instance-ids "$GREEN_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
               "sudo dnf install -y nginx",
@@ -41,62 +49,126 @@ jobs:
         run: |
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "i-02e6e4c9ede81f5a4"
+            --instance-id "$GREEN_INSTANCE_ID"
 
       - name: Check SSM Deployment Status
         run: |
           STATUS=$(aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
-            --instance-id "i-02e6e4c9ede81f5a4" \
+            --instance-id "$GREEN_INSTANCE_ID" \
             --query "Status" \
             --output text)
 
           echo "Deployment status: $STATUS"
 
           if [ "$STATUS" != "Success" ]; then
-            echo "Deployment failed."
-            echo "Production traffic will NOT be switched."
+            echo "Deployment failed before traffic switch."
             exit 1
           fi
 
       - name: Wait for Green Target to Become Healthy
         run: |
           aws elbv2 wait target-in-service \
-            --target-group-arn "arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425" \
-            --targets Id="i-02e6e4c9ede81f5a4",Port=80
+            --target-group-arn "$GREEN_TG_ARN" \
+            --targets Id="$GREEN_INSTANCE_ID",Port=80
 
       - name: Switch Production Traffic to Green
         run: |
           aws elbv2 modify-listener \
-            --listener-arn "arn:aws:elasticloadbalancing:ap-south-1:466749146115:listener/app/CMS-PROD-ALB/186ae3866b40321d/94172dd3b6a19e17" \
-            --default-actions '[
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions "[
               {
-                "Type": "forward",
-                "ForwardConfig": {
-                  "TargetGroups": [
+                \"Type\": \"forward\",
+                \"ForwardConfig\": {
+                  \"TargetGroups\": [
                     {
-                      "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-BLUE-TG/06abf1f6715cc596",
-                      "Weight": 0
+                      \"TargetGroupArn\": \"$BLUE_TG_ARN\",
+                      \"Weight\": 0
                     },
                     {
-                      "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425",
-                      "Weight": 100
+                      \"TargetGroupArn\": \"$GREEN_TG_ARN\",
+                      \"Weight\": 100
                     }
                   ]
                 }
               }
-            ]'
+            ]"
 
-      - name: Verify Listener Traffic Switch
-        run: |
-          aws elbv2 describe-listeners \
-            --listener-arns "arn:aws:elasticloadbalancing:ap-south-1:466749146115:listener/app/CMS-PROD-ALB/186ae3866b40321d/94172dd3b6a19e17" \
-            --query "Listeners[0].DefaultActions[0].ForwardConfig.TargetGroups"
+      - name: Wait for Traffic Switch
+        run: sleep 20
 
-      - name: Deployment Completed
+      - name: Test Production Application
+        id: production-test
+        continue-on-error: true
         run: |
-          echo "Version 3.0 deployed successfully."
-          echo "Green target is healthy."
-          echo "Blue traffic weight is 0."
-          echo "Green traffic weight is 100."
-          echo "Production traffic switched to Green successfully."
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns "$ALB_ARN" \
+            --query "LoadBalancers[0].DNSName" \
+            --output text)
+
+          echo "Testing: http://$ALB_DNS"
+
+          HTTP_STATUS=$(curl \
+            --silent \
+            --output response.html \
+            --write-out "%{http_code}" \
+            --max-time 20 \
+            "http://$ALB_DNS")
+
+          echo "HTTP Status: $HTTP_STATUS"
+
+          cat response.html
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Application HTTP check failed."
+            exit 1
+          fi
+
+          if ! grep -q "Version 3.0" response.html; then
+            echo "Expected Version 3.0 not found."
+            exit 1
+          fi
+
+          echo "Production validation successful."
+
+      - name: Automatic Rollback to Blue
+        if: steps.production-test.outcome == 'failure'
+        run: |
+          echo "Production validation failed."
+          echo "Starting automatic rollback."
+
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions "[
+              {
+                \"Type\": \"forward\",
+                \"ForwardConfig\": {
+                  \"TargetGroups\": [
+                    {
+                      \"TargetGroupArn\": \"$BLUE_TG_ARN\",
+                      \"Weight\": 100
+                    },
+                    {
+                      \"TargetGroupArn\": \"$GREEN_TG_ARN\",
+                      \"Weight\": 0
+                    }
+                  ]
+                }
+              }
+            ]"
+
+          echo "Traffic switched back to Blue."
+
+      - name: Fail Workflow After Rollback
+        if: steps.production-test.outcome == 'failure'
+        run: |
+          echo "Deployment failed."
+          echo "Automatic rollback completed."
+          exit 1
+
+      - name: Deployment Successful
+        if: steps.production-test.outcome == 'success'
+        run: |
+          echo "Green deployment successful."
+          echo "Production validation successful."
+          echo "No rollback required."
