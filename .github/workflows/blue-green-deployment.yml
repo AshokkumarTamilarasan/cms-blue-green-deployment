@@ -22,7 +22,6 @@ jobs:
           aws-region: ap-south-1
 
       - name: Deploy Version 3.0 to Green using SSM
-        id: deploy
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "i-02e6e4c9ede81f5a4" \
@@ -70,11 +69,34 @@ jobs:
         run: |
           aws elbv2 modify-listener \
             --listener-arn "arn:aws:elasticloadbalancing:ap-south-1:466749146115:listener/app/CMS-PROD-ALB/186ae3866b40321d/94172dd3b6a19e17" \
-            --default-actions \
-            Type=forward,TargetGroupArn="arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425"
+            --default-actions '[
+              {
+                "Type": "forward",
+                "ForwardConfig": {
+                  "TargetGroups": [
+                    {
+                      "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-BLUE-TG/06abf1f6715cc596",
+                      "Weight": 0
+                    },
+                    {
+                      "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425",
+                      "Weight": 100
+                    }
+                  ]
+                }
+              }
+            ]'
+
+      - name: Verify Listener Traffic Switch
+        run: |
+          aws elbv2 describe-listeners \
+            --listener-arns "arn:aws:elasticloadbalancing:ap-south-1:466749146115:listener/app/CMS-PROD-ALB/186ae3866b40321d/94172dd3b6a19e17" \
+            --query "Listeners[0].DefaultActions[0].ForwardConfig.TargetGroups"
 
       - name: Deployment Completed
         run: |
           echo "Version 3.0 deployed successfully."
           echo "Green target is healthy."
-          echo "Production traffic switched to Green."
+          echo "Blue traffic weight is 0."
+          echo "Green traffic weight is 100."
+          echo "Production traffic switched to Green successfully."
