@@ -1,0 +1,25 @@
+name: AWS OIDC Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test-aws-connection:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::466749146115:role/GitHubActions-BlueGreen-Role
+          aws-region: ap-south-1
+
+      - name: Verify AWS Connection
+        run: aws sts get-caller-identity
