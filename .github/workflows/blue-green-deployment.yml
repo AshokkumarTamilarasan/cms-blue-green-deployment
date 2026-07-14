@@ -1,0 +1,80 @@
+name: Blue Green Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-to-green:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::466749146115:role/GitHubActions-BlueGreen-Role
+          aws-region: ap-south-1
+
+      - name: Deploy Version 3.0 to Green using SSM
+        id: deploy
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "i-02e6e4c9ede81f5a4" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "sudo dnf install -y nginx",
+              "echo '\''<html><body><h1>CMS GREEN ENVIRONMENT</h1><p>Version 3.0 - Deployed by GitHub Actions</p></body></html>'\'' | sudo tee /usr/share/nginx/html/index.html",
+              "sudo systemctl enable nginx",
+              "sudo systemctl restart nginx"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+
+      - name: Wait for SSM Deployment
+        run: |
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "i-02e6e4c9ede81f5a4"
+
+      - name: Check SSM Deployment Status
+        run: |
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "i-02e6e4c9ede81f5a4" \
+            --query "Status" \
+            --output text)
+
+          echo "Deployment status: $STATUS"
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Deployment failed."
+            echo "Production traffic will NOT be switched."
+            exit 1
+          fi
+
+      - name: Wait for Green Target to Become Healthy
+        run: |
+          aws elbv2 wait target-in-service \
+            --target-group-arn "arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425" \
+            --targets Id="i-02e6e4c9ede81f5a4",Port=80
+
+      - name: Switch Production Traffic to Green
+        run: |
+          aws elbv2 modify-listener \
+            --listener-arn "arn:aws:elasticloadbalancing:ap-south-1:466749146115:listener/app/CMS-PROD-ALB/186ae3866b40321d/94172dd3b6a19e17" \
+            --default-actions \
+            Type=forward,TargetGroupArn="arn:aws:elasticloadbalancing:ap-south-1:466749146115:targetgroup/CMS-GREEN-TG/ddfe157ed7357425"
+
+      - name: Deployment Completed
+        run: |
+          echo "Version 3.0 deployed successfully."
+          echo "Green target is healthy."
+          echo "Production traffic switched to Green."
